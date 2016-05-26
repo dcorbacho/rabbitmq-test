@@ -30,6 +30,7 @@
 %% The first two are change_policy, the last two are change_cluster
 
 -compile(export_all).
+-include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
@@ -63,7 +64,7 @@ change_policy([CfgA, _CfgB, _CfgC] = Cfgs) ->
     assert_slaves(A, ?QNAME, {A, [C]}, [{A, [B, C]}]),
 
     %% Clear the policy, and we go back to non-mirrored
-    clear_policy(CfgA, ?POLICY),
+    ok = clear_policy(CfgA, ?POLICY),
     assert_slaves(A, ?QNAME, {A, ''}),
 
     %% Test switching "away" from an unmirrored node
@@ -132,7 +133,7 @@ rapid_loop(Cfg, MRef) ->
             exit({amqp_ops_died, Reason})
     after 0 ->
             set_ha_policy(Cfg, ?POLICY, <<"all">>),
-            clear_policy(Cfg, ?POLICY),
+            ok = clear_policy(Cfg, ?POLICY),
             rapid_loop(Cfg, MRef)
     end.
 
@@ -178,6 +179,10 @@ promote_on_shutdown([CfgA, CfgB]) ->
                                  durable = true}),
     ok.
 
+random_policy_with() -> cluster_abc.
+random_policy([_CfgA, _CfgB, _CfgC] = Cfgs) ->
+    run_proper(fun prop_random_policy/1, [Cfgs]).
+
 %%----------------------------------------------------------------------------
 
 assert_slaves(RPCNode, QName, Exp) ->
@@ -206,7 +211,7 @@ assert_slaves0(RPCNode, QName, {ExpMNode, ExpSNodes}, PermittedIntermediate) ->
             case [found || {PermMNode, PermSNodes} <- PermittedIntermediate,
                            PermMNode =:= ActMNode,
                            equal_list(PermSNodes, ActSNodes)] of
-                [] -> ct:fail("Expected ~p / ~p, got ~p / ~p~nat ~p~n",
+                [] -> io:format(user, "Expected ~p / ~p, got ~p / ~p~nat ~p~n",
                               [ExpMNode, ExpSNodes, ActMNode, ActSNodes,
                                get_stacktrace()]);
                 _  -> timer:sleep(100),
@@ -252,3 +257,105 @@ get_stacktrace() ->
         _:e ->
             erlang:get_stacktrace()
     end.
+
+%%----------------------------------------------------------------------------
+run_proper(Fun, Args) ->
+    case proper:counterexample(erlang:apply(Fun, Args),
+                               [{numtests, 25},
+                                {on_output, fun(F, A) ->
+                                                    io:format(user, F, A)
+                                            end}]) of
+        true ->
+            true;
+        Value ->
+            exit(Value)
+    end.
+
+prop_random_policy([CfgA, _CfgB, _CfgC] = Cfgs) ->
+    Nodes = [proplists:get_value(node, Cfg) || Cfg <- Cfgs],
+    ?FORALL(
+       Policies, non_empty(list(policy_gen(Nodes))),
+       begin
+           Ch = pget(channel, CfgA),
+           amqp_channel:call(Ch, #'queue.declare'{queue = ?QNAME}),
+           %% Add some load so mirrors can be busy synchronising
+           publish(Ch, ?QNAME, 100000),
+           %% Apply policies in parallel on all nodes
+           apply_in_parallel(Cfgs, Policies),
+           %% The last policy is the final state
+           Last = lists:last(Policies),
+           %% Give it some time to generate all internal notifications
+           timer:sleep(2000),
+           %% Ensure the owner/master is able to process a call request,
+           %% which means that all pending casts have been processed.
+           %% Use the information returned by owner/master to verify the
+           %% test result
+           Node = proplists:get_value(node, CfgA),
+           Info = find_queue(?QNAME, Node),
+           %% Gets owner/master
+           Pid = proplists:get_value(pid, Info),
+           FinalInfo = rpc:call(node(Pid), gen_server, call, [Pid, info], 5000),
+           %% Check the result
+           Result = verify_policy(Last, FinalInfo),
+           %% Cleanup
+           amqp_channel:call(Ch, #'queue.delete'{queue = ?QNAME}),
+           _ = clear_policy(CfgA, ?POLICY),
+           Result
+       end).
+
+apply_in_parallel(Cfgs, Policies) ->
+    Self = self(),
+    [spawn_link(fun() ->
+                        [begin
+                             apply_policy(Cfg, Policy)
+                         end || Policy <- Policies],
+                        Self ! parallel_task_done
+                end) || Cfg <- Cfgs],
+    [receive
+         parallel_task_done ->
+             ok
+     end || _ <- Cfgs].
+
+%% Proper generators
+policy_gen(Nodes) ->
+    %% Stop mirroring needs to be called often to trigger rabbitmq-server#803
+    frequency([{3, undefined},
+               {1, all},
+               {1, {nodes, nodes_gen(Nodes)}},
+               {1, {exactly, choose(1, 3)}}
+              ]).
+
+nodes_gen(Nodes) ->
+    ?LET(List, non_empty(list(oneof(Nodes))),
+         sets:to_list(sets:from_list(List))).
+
+%% Checks
+verify_policy(undefined, Info) ->
+    %% If the queue is not mirrored, it returns ''
+    '' == proplists:get_value(slave_pids, Info);
+verify_policy(all, Info) ->
+    2 == length(proplists:get_value(slave_pids, Info));
+verify_policy({exactly, 1}, Info) ->
+    %% If the queue is mirrored, it returns a list
+    [] == proplists:get_value(slave_pids, Info);
+verify_policy({exactly, N}, Info) ->
+    (N - 1) == length(proplists:get_value(slave_pids, Info));
+verify_policy({nodes, Nodes}, Info) ->
+    Master = node(proplists:get_value(pid, Info)),
+    Slaves = [node(P) || P <- proplists:get_value(slave_pids, Info)],
+    lists:sort(Nodes) == lists:sort([Master | Slaves]).
+
+%% Policies
+apply_policy(Cfg, undefined) ->
+    _ = clear_policy(Cfg, ?POLICY);
+apply_policy(Cfg, all) ->
+    set_ha_policy(Cfg, ?POLICY, <<"all">>,
+                  [{<<"ha-sync-mode">>, <<"automatic">>}]);
+apply_policy(Cfg, {nodes, Nodes}) ->
+    NNodes = [a2b(Node) || Node <- Nodes],
+    set_ha_policy(Cfg, ?POLICY, {<<"nodes">>, NNodes},
+                  [{<<"ha-sync-mode">>, <<"automatic">>}]);
+apply_policy(Cfg, {exactly, Exactly}) ->
+    set_ha_policy(Cfg, ?POLICY, {<<"exactly">>, Exactly},
+                  [{<<"ha-sync-mode">>, <<"automatic">>}]).
+

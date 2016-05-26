@@ -35,7 +35,7 @@ set_policy(Cfg, Name, Pattern, ApplyTo, Definition) ->
                   [<<"/">>, Name, Pattern, Definition, 0, ApplyTo]).
 
 clear_policy(Cfg, Name) ->
-    ok = rpc:call(pget(node, Cfg), rabbit_policy, delete, [<<"/">>, Name]).
+    rpc:call(pget(node, Cfg), rabbit_policy, delete, [<<"/">>, Name]).
 
 set_param(Cfg, Component, Name, Value) ->
     ok = rpc:call(pget(node, Cfg), rabbit_runtime_parameters, set,
